@@ -5,7 +5,7 @@ import random
 
 # UDP socket as server
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server.bind(('', 53))
+server.bind(('127.0.0.1', 12000))
 
 # List about the domain name and IPv4 address of root DNS servers
 root = [('a.root-servers.net', '198.41.0.4'),
@@ -46,15 +46,14 @@ def has_cached(qname, qtype):
 def get_from_cache(qname, qtype, qheader):
     # create response message from cache
     res = dnslib.DNSRecord(
-        dnslib.DNSHeader(id=qheader.id, q=qheader.q, r=cache[qname][qtype][2], auth=cache[qname][qtype][3],
+        dnslib.DNSHeader(id=qheader.id, qr=1, q=qheader.q, r=cache[qname][qtype][2], auth=cache[qname][qtype][3],
                          ra=cache[qname][qtype][4]), q=dnslib.DNSQuestion(qname, qtype), rr=cache[qname][qtype][5],
         auth=cache[qname][qtype][6], ar=cache[qname][qtype][7])
-    res.header.qr=1
     return bytes(res.pack())
 
 
-def add_cache(qname, qtype, msg):
-    record = dnslib.DNSRecord.parse(msg)
+def add_cache(qname, qtype, message):
+    record = dnslib.DNSRecord.parse(message)
 
     cur_t = int(time.time())  # record current time
     ttl = 9999999999999999999999999999
@@ -66,6 +65,71 @@ def add_cache(qname, qtype, msg):
     # store all information in cache
     cache[str(qname)][qtype] = [cur_t, ttl, record.header.a, record.header.auth, record.header.ar,
                                 record.rr, record.auth, record.ar]
+
+
+# implement iterative query
+
+def get_address(message):
+    tmp = []
+    tmpreq = dnslib.DNSRecord.parse(message)
+    tmpreq.header.rd = 0
+    message = bytes(tmpreq.pack())
+    if has_cached(str(tmpreq.q.qname), tmpreq.q.qtype):  # check if the query is cached
+        return get_from_cache(str(tmpreq.q.qname), tmpreq.q.qtype, tmpreq.header)  # get reply from cache
+    nextaddr = root[random.randint(0, 12)][1]  # initiate next address with the address of root name server
+    while True:
+        dns.sendto(message, (nextaddr, 53))  # forward query to next name server
+        msgg = dns.recv(4096)
+        tmpreq = dnslib.DNSRecord.parse(msgg)
+        if tmpreq.header.a != 0:  # if the response has response RR
+            flag = False
+            for rr in tmpreq.rr:
+                if rr.rtype == 1:
+                    flag = True
+                    break
+            # if no A RR
+            if not flag:
+                tmp.extend(tmpreq.rr)
+                # modify query message
+                tmppreq = dnslib.DNSRecord.parse(msg)
+                tmppreq.q.qname = str(tmpreq.rr[0].rdata)
+                msgg = bytes(tmppreq.pack())
+                msgg = get_address(msgg)
+                # add the CNAME RR
+                tmppreq = dnslib.DNSRecord.parse(msgg)
+                tmp.extend(tmppreq.rr)
+                tmppreq.rr = tmp
+                msgg = bytes(tmppreq.pack())
+                add_cache(str(req.q.qname), req.q.qtype, msgg)  # add cache
+                response_msg = get_from_cache(str(req.q.qname), req.q.qtype,
+                                              req.header)  # use cache to create answer
+                return response_msg
+            else:
+                # if no A RR
+                # add the CNAME RR
+                tmppreq = dnslib.DNSRecord.parse(msgg)
+                tmp.extend(tmppreq.rr)
+                tmppreq.rr = tmp
+                tmppreq.header.a = len(tmpreq.rr)
+                msgg = bytes(tmppreq.pack())
+                add_cache(str(req.q.qname), req.q.qtype, msgg)  # add cache
+                response_msg = get_from_cache(str(req.q.qname), req.q.qtype,
+                                              req.header)  # use cache to create answer
+                return response_msg
+        flag = False
+        for rr in tmpreq.ar:  # find if next address is in ar
+            if rr.rtype == 1:
+                nextaddr = str(rr.rdata)  # set the address of the next server
+                flag=True
+                break
+        if not flag and tmpreq.header.auth != 0 and tmpreq.header.a == 0:  # if next address is not in ar
+            # find next address
+            tmppreq = dnslib.DNSRecord.parse(message)
+            tmppreq.q.qname = dnslib.DNSLabel(str(tmpreq.auth[0].rdata))
+            msggg = bytes(tmppreq.pack())
+            msggg = get_address(msggg)
+            tmppreq = dnslib.DNSRecord.parse(msggg)
+            nextaddr = str(tmppreq.rr[0].rdata)
 
 
 if __name__ == '__main__':
@@ -89,36 +153,5 @@ if __name__ == '__main__':
                                         req.header)  # use cache to create answer
             else:
                 print('Get from recursive query')
-                nextaddr = root[random.randint(0, 12)][1]  # initiate next address with the address of root name server
-                tmp = []
-                tmpreq = dnslib.DNSRecord.parse(msg)
-                tmpreq.header.rd = 0
-                msg = bytes(tmpreq.pack())
-                while True:
-                    dns.sendto(msg, (nextaddr, 53))  # forward query to next name server
-                    msgg = dns.recv(2048)
-                    tmpreq = dnslib.DNSRecord.parse(msgg)
-                    if tmpreq.header.a == 0 and tmpreq.header.auth == 0:
-                        # if the query is refused, start from root server again
-                        nextaddr = root[random.randint(0, 12)][1]
-                        continue
-                    if tmpreq.header.a != 0:
-                        if tmpreq.header.a == 1 and tmpreq.rr[0].rtype == 5 and req.q.qtype == 1:
-                            # change query name to canonical name
-                            tmppreq = dnslib.DNSRecord.parse(msg)
-                            tmppreq.q.qname = dnslib.DNSLabel(str(tmpreq.rr[0].rdata))
-                            msg = bytes(tmppreq.pack())
-                            tmp.append(tmpreq.rr[0])  # record CNAME RR
-                            continue
-                        # add the CNAME RR
-                        tmppreq = dnslib.DNSRecord.parse(msgg)
-                        tmp.extend(tmppreq.rr)
-                        tmppreq.rr = tmp
-                        tmppreq.header.a = tmppreq.header.a + 1
-                        msgg = bytes(tmppreq.pack())
-                        add_cache(str(req.q.qname), req.q.qtype, msgg)  # add cache
-                        resmsg = get_from_cache(str(req.q.qname), req.q.qtype,
-                                                req.header)  # use cache to create answer
-                        break
-                    nextaddr = str(tmpreq.ar[0].rdata)  # set the address of the next server
+                resmsg = get_address(msg)
         server.sendto(resmsg, addr)  # send answer to client
